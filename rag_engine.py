@@ -1,13 +1,13 @@
+from __future__ import annotations
 import os
 import re
 import time
+import json
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dotenv import load_dotenv
-from FlagEmbedding import BGEM3FlagModel
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
 
 load_dotenv()
 
@@ -17,7 +17,7 @@ SEARCH_URL = "http://www.law.go.kr/DRF/lawSearch.do"
 DETAIL_URL = "http://www.law.go.kr/DRF/lawService.do"
 COLLECTION_NAME = "traffic_precedents"
 EMBEDDING_DIM = 1024  # BGE-M3 default dimension
-SCORE_THRESHOLD = 0.0  # 임계값 (0이면 항상 결과 반환)
+SCORE_THRESHOLD = 0.0  # 항상 가장 유사한 판례 반환
 
 # 재시도 설정이 포함된 세션
 session = requests.Session()
@@ -67,9 +67,13 @@ def get_precedent_detail(prec_id: str) -> dict:
 def collect_traffic_precedents() -> list[dict]:
     """교통사고 관련 판례를 수집하여 본문까지 가져온다."""
     keywords = [
-        "교통사고", "교통사고 과실", "추돌",
+        "교통사고", "교통사고 과실", "추돌", "충돌사고",
         "음주운전 사고", "도로교통법 위반", "교통사고처리특례법",
-        "손해배상 교통사고",
+        "손해배상 교통사고", "과실비율", "과실상계",
+        "보행자 사고", "횡단보도 사고", "킥보드 사고", "자전거 사고",
+        "중앙선 침범", "신호위반 사고", "뺑소니",
+        "차량 손해배상", "대물배상", "대인배상",
+        "주차 차량 충돌", "정차 차량", "후방추돌",
     ]
     all_details = []
     seen_ids = set()
@@ -122,11 +126,11 @@ def build_document(detail: dict) -> dict | None:
     if not any(kw in all_text for kw in traffic_keywords):
         return None
 
-    # 임베딩에 사용할 텍스트 구성 (판례내용도 포함하여 검색 품질 향상)
-    body = summary if summary else content[:2000]
-    text = f"사건명: {case_name}\n판시사항: {issue}\n판결요지: {body}"
+    # 임베딩용 텍스트: 핵심 요약 필드만 (사건명 + 판시사항 + 판결요지)
+    # 판례내용은 길고 노이즈가 많아 임베딩에서 제외, 리랭킹에서만 활용
+    text = f"{case_name}\n{issue}\n{summary}".strip()
 
-    if not text.strip() or len(text) < 20:
+    if len(text) < 20:
         return None
 
     return {
@@ -151,12 +155,19 @@ def build_document(detail: dict) -> dict | None:
 
 class PrecedentRAG:
     def __init__(self):
+        os.environ["TMPDIR"] = "/tmp"
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        from FlagEmbedding import BGEM3FlagModel, FlagReranker
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import Distance, VectorParams
         print("BGE-M3 모델 로딩 중...")
-        self.model = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
+        self.model = BGEM3FlagModel("BAAI/bge-m3", use_fp16=True, devices=["cuda:0"])
+        print("리랭커 모델 로딩 중...")
+        self.reranker = FlagReranker("BAAI/bge-reranker-v2-m3", use_fp16=True)
         self.client = QdrantClient(path="./qdrant_data")
-        self._ensure_collection()
+        self._ensure_collection(Distance, VectorParams)
 
-    def _ensure_collection(self):
+    def _ensure_collection(self, Distance, VectorParams):
         collections = [c.name for c in self.client.get_collections().collections]
         if COLLECTION_NAME not in collections:
             self.client.create_collection(
@@ -168,14 +179,17 @@ class PrecedentRAG:
             )
             print(f"컬렉션 '{COLLECTION_NAME}' 생성 완료")
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        result = self.model.encode(texts, batch_size=64, max_length=512)
+    def embed(self, texts: list[str], max_length: int = 512) -> list[list[float]]:
+        result = self.model.encode(texts, batch_size=64, max_length=max_length)
         return result["dense_vecs"].tolist()
 
     def index_documents(self, documents: list[dict], batch_size: int = 64):
         """문서 리스트를 배치 단위로 임베딩하여 Qdrant에 저장"""
+        from qdrant_client.models import PointStruct
+
         total = len(documents)
-        idx_offset = 0
+        upsert_executor = ThreadPoolExecutor(max_workers=1)
+        upsert_future = None
 
         for i in range(0, total, batch_size):
             batch = documents[i:i + batch_size]
@@ -184,7 +198,7 @@ class PrecedentRAG:
 
             points = [
                 PointStruct(
-                    id=idx_offset + j,
+                    id=i + j,
                     vector=vec,
                     payload={
                         "prec_id": doc["id"],
@@ -195,50 +209,81 @@ class PrecedentRAG:
                 for j, (doc, vec) in enumerate(zip(batch, vectors))
             ]
 
-            self.client.upsert(collection_name=COLLECTION_NAME, points=points)
-            idx_offset += len(batch)
+            if upsert_future is not None:
+                upsert_future.result()
+
+            upsert_future = upsert_executor.submit(
+                self.client.upsert, collection_name=COLLECTION_NAME, points=points
+            )
             print(f"  임베딩 진행: {min(i + batch_size, total)}/{total}건")
+
+        if upsert_future is not None:
+            upsert_future.result()
+        upsert_executor.shutdown()
 
         print(f"{total}건 인덱싱 완료")
 
-    def search(self, query: str, top_k: int = 5, candidate_k: int = 100) -> list[dict]:
-        """쿼리와 유사한 판례 검색 (dense 상위 후보 → 리랭킹)"""
-        # 1단계: dense 벡터로 상위 candidate_k건 가져오기
-        query_vec = self.embed([query])[0]
+    QUERY_SYNONYMS = {
+        "뺑소니": "도주치상 도주차량 사고후미조치 교통사고 후 도주",
+        "음주운전": "도로교통법위반 음주측정 혈중알코올농도 위드마크",
+        "무면허": "무면허운전 도로교통법위반",
+        "과실비율": "과실상계 기여과실 공동과실",
+        "과실상계": "과실비율 기여과실 공동과실",
+        "보행자": "횡단보도 보행 피해자",
+        "추돌": "충돌 다중추돌 접촉사고",
+        "사망": "치사 사상 업무상과실치사",
+        "상해": "치상 부상 업무상과실치상",
+        "신호위반": "신호 도로교통법위반 교차로",
+        "손해배상": "위자료 대인배상 대물배상 일실수입",
+        "위자료": "손해배상 정신적 손해 위자료 산정",
+        "역주행": "중앙선침범 중앙선 역주행",
+        "중앙선침범": "역주행 중앙선",
+    }
+
+    def _expand_query(self, query: str) -> str:
+        """쿼리에 법률 동의어를 추가하여 확장"""
+        expansions = []
+        for keyword, synonyms in self.QUERY_SYNONYMS.items():
+            if keyword in query:
+                expansions.append(synonyms)
+        if expansions:
+            return f"{query} ({' '.join(expansions)})"
+        return query
+
+    def search(self, query: str, top_k: int = 5, rerank_k: int = 100) -> list[dict]:
+        """쿼리와 유사한 판례 검색 (dense 상위 후보 → cross-encoder 리랭킹)"""
+        # 쿼리 확장 (법률 동의어)
+        expanded_query = self._expand_query(query)
+        if expanded_query != query:
+            print(f"쿼리 확장: {expanded_query}")
+
+        # 1단계: dense 벡터로 상위 후보 가져오기 (원본 쿼리 사용)
+        query_with_instruction = f"Represent this sentence for searching relevant passages: {query}"
+        query_vec = self.embed([query_with_instruction])[0]
         results = self.client.query_points(
             collection_name=COLLECTION_NAME,
             query=query_vec,
-            limit=candidate_k,
+            limit=rerank_k,
             with_payload=True,
         )
 
         if not results.points:
             return []
 
-        print(f"상위 {len(results.points)}건 후보 대상 리랭킹 시작...")
+        print(f"상위 {len(results.points)}건 판례 대상 리랭킹...")
 
-        # 리랭킹용 텍스트: 판례내용(사실관계)을 포함하여 구성
-        candidate_texts = []
+        # 2단계: cross-encoder 리랭킹 (판시사항 + 판결요지 기준)
+        rerank_texts = []
         for p in results.points:
-            content = p.payload.get("판례내용", "")[:1500]
             rerank_text = (
-                f"사건명: {p.payload.get('사건명', '')}\n"
-                f"판시사항: {p.payload.get('판시사항', '')}\n"
-                f"판결요지: {p.payload.get('판결요지', '')}\n"
-                f"판례내용: {content}"
+                f"{p.payload.get('사건명', '')}\n"
+                f"{p.payload.get('판시사항', '')}\n"
+                f"{p.payload.get('판결요지', '')}"
             )
-            candidate_texts.append(rerank_text)
+            rerank_texts.append(rerank_text)
 
-        # 2단계: BGE-M3 compute_score로 리랭킹
-        sentence_pairs = [[query, text] for text in candidate_texts]
-        rerank_result = self.model.compute_score(
-            sentence_pairs,
-            batch_size=32,
-            max_query_length=512,
-            max_passage_length=8192,
-            weights_for_different_modes=[0.2, 0.4, 0.4],  # [dense, sparse, colbert]
-        )
-        rerank_scores = rerank_result["colbert+sparse+dense"]
+        sentence_pairs = [[expanded_query, text] for text in rerank_texts]
+        rerank_scores = self.reranker.compute_score(sentence_pairs, normalize=True)
         if isinstance(rerank_scores, float):
             rerank_scores = [rerank_scores]
 
@@ -265,8 +310,31 @@ class PrecedentRAG:
 
 def ingest():
     """판례 수집 → 임베딩 → Qdrant 저장"""
-    print("=== 판례 수집 시작 ===")
-    raw_data = collect_traffic_precedents()
+    import gc
+
+    cache_path = "ingest_cache.json"
+
+    if os.path.exists(cache_path):
+        print(f"=== 캐시 파일({cache_path})에서 로드 ===")
+        with open(cache_path, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        print(f"캐시에서 {len(cached)}건 로드 완료")
+
+        # 캐시가 이미 build_document 처리된 형태({id, text, metadata})인지 확인
+        if cached and "metadata" in cached[0]:
+            # metadata에서 원본 필드를 꺼내 build_document를 다시 적용
+            raw_data = []
+            for item in cached:
+                detail = {"판례일련번호": item["id"], **item["metadata"]}
+                raw_data.append(detail)
+        else:
+            raw_data = cached
+    else:
+        print("=== 판례 수집 시작 ===")
+        raw_data = collect_traffic_precedents()
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(raw_data, f, ensure_ascii=False)
+        print(f"캐시 저장 완료: {cache_path}")
 
     documents = []
     for detail in raw_data:
@@ -276,12 +344,17 @@ def ingest():
 
     print(f"{len(documents)}건 문서 변환 완료")
 
+    # requests 세션 정리 후 모델 로딩
+    session.close()
+    del raw_data
+    gc.collect()
+
     rag = PrecedentRAG()
     rag.index_documents(documents)
     print("=== 인덱싱 완료 ===")
 
 
-def query(question: str, top_k: int = 5):
+def query(question: str, top_k: int = 1):
     """질문에 대해 유사 판례 검색"""
     rag = PrecedentRAG()
     results = rag.search(question, top_k=top_k)
@@ -293,9 +366,6 @@ def query(question: str, top_k: int = 5):
 
     if not filtered:
         print("관련 판례를 찾지 못했습니다.")
-        if results:
-            print(f"(최고 유사도: {results[0]['score']:.4f}, 임계값: {SCORE_THRESHOLD})")
-        print()
         return []
 
     for i, r in enumerate(filtered, 1):
@@ -303,6 +373,33 @@ def query(question: str, top_k: int = 5):
         print(f"    사건명: {r['사건명']}")
         print(f"    사건번호: {r['사건번호']}")
         print(f"    법원명: {r['법원명']} | 선고일자: {r['선고일자']}")
+        print(f"    판결유형: {r['판결유형']}")
+
+        # 판례 본문에서 핵심 정보 추출
+        full_text = f"{r['판결요지']} {r['판례내용']}"
+
+        # 과실비율
+        ratios = re.findall(r'(?:과실|책임)\s*(?:비율|상계)?\s*[^0-9]*(\d{1,3})\s*[:%：]\s*(\d{1,3})', full_text)
+        if not ratios:
+            ratios = re.findall(r'(\d{1,3})\s*[%％퍼센트]\s*(?:의?\s*과실|로\s*(?:봄|정함|인정))', full_text)
+        if ratios:
+            if isinstance(ratios[0], tuple):
+                print(f"    ★ 과실비율: {ratios[0][0]}:{ratios[0][1]}")
+            else:
+                print(f"    ★ 과실비율: {ratios[0]}%")
+
+        # 형량 (징역/벌금/금고)
+        sentences = re.findall(r'(징역|금고|벌금)\s*([\d,]+\s*(?:년|월|만\s*원|원)[\s\d,년월일]*)', full_text)
+        if sentences:
+            for stype, sval in sentences[:2]:
+                print(f"    ★ {stype}: {sval.strip()}")
+
+        # 손해배상액
+        damages = re.findall(r'(?:손해배상|위자료|합계)\s*(?:금액|액)?[^0-9]*([\d,]+)\s*원', full_text)
+        if damages:
+            for d in damages[:2]:
+                print(f"    ★ 배상액: {d}원")
+
         print(f"    판시사항: {r['판시사항']}")
         body = r['판결요지'] if r['판결요지'] else r['판례내용']
         print(f"    판결요지: {body}")
