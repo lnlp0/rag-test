@@ -1,3 +1,4 @@
 .env
 qdrant_data/
 __pycache__/
+ingest_cache.json
