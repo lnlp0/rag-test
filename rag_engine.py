@@ -68,7 +68,8 @@ TAG_RULES = {
 }
 
 PARTY_RULES = [
-    ("차대사람", ["보행자", "횡단보도를 건너", "보행 중"]),
+    ("차대사람", ["보행자", "횡단보도를 건너", "보행 중", "시민을", "행인",
+                "사람을 치", "사람을 박", "걸어다니", "걸어가", "건너던"]),
     ("차대이륜", ["자전거", "킥보드", "오토바이", "원동기장치자전거", "이륜"]),
 ]
 
@@ -90,7 +91,7 @@ TRAFFIC_FILTER_KEYWORDS = sorted(_ALL_TAG_KEYWORDS | {
 def search_precedents(query: str, display: int = 20, page: int = 1) -> list[dict]:
     params = {
         "OC": OC, "target": "prec", "type": "JSON",
-        "query": query, "display": display, "page": page,
+        "query": query, "display": display, "page": page, "search": 2,
     }
     resp = session.get(SEARCH_URL, params=params, timeout=30)
     resp.raise_for_status()
@@ -240,8 +241,40 @@ def _split_points(text: str) -> list[str]:
     return chunks if chunks else [text]
 
 
+def _extract_reason(content: str) -> str:
+    """판례내용에서 【이    유】 섹션을 추출"""
+    # 【이 유】 패턴 (공백 다양)
+    m = re.search(r'【이\s*유\s*】\s*', content)
+    if m:
+        return content[m.end():]
+    # 마커 없으면 【주 문】 이후 전체
+    m = re.search(r'【주\s*문\s*】.*?(?=\d+\.)', content, re.DOTALL)
+    if m:
+        return content[m.end():]
+    return content
+
+
+def _chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str]:
+    """긴 텍스트를 오버랩 청킹으로 분할"""
+    if len(text) <= chunk_size:
+        return [text] if len(text) >= 30 else []
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end].strip()
+        if len(chunk) >= 30:
+            chunks.append(chunk)
+        start += chunk_size - overlap
+    return chunks
+
+
 def build_documents(detail: dict) -> list[dict]:
     """판례 1건 → 멀티포인트 청킹으로 N개 문서 반환"""
+    # 에러 응답 필터링
+    if "Law" in detail and "판례일련번호" not in detail:
+        return []
+
     fields = {k: _strip_html(detail.get(k, "")) for k in [
         "사건명", "사건번호", "법원명", "선고일자", "판결유형",
         "판시사항", "판결요지", "판례내용", "참조조문", "참조판례",
@@ -252,20 +285,29 @@ def build_documents(detail: dict) -> list[dict]:
         return []
 
     issue, summary = fields["판시사항"], fields["판결요지"]
-
-    # [개선1] 빈 판례 제거: 판시사항+판결요지 둘 다 없으면 인덱싱 안 함
-    if not issue and not summary:
-        return []
+    content = fields["판례내용"]
 
     tags = _auto_tag(all_text)
     prec_id = detail.get("판례일련번호", "")
     metadata = {**fields, **tags}
 
-    # [개선3] 멀티포인트 청킹: 판시사항의 [1],[2]를 분리
+    # 청킹 전략: 판시사항 > 판결요지 > 판례내용(이유 섹션)
+    CONTENT_FILTER_KEYWORDS = [
+        "교통", "도로교통법", "자동차", "운전", "치사", "치상",
+        "보험", "손해배상", "구상금", "과실", "사고",
+    ]
     if issue:
         chunks = _split_points(issue)
-    else:
+    elif summary:
         chunks = [summary[:500]]
+    elif content:
+        # 판시사항/판결요지 없는 경우: 사건명 기준 교통 관련만 허용
+        if not any(kw in fields["사건명"] for kw in CONTENT_FILTER_KEYWORDS):
+            return []
+        reason = _extract_reason(content)
+        chunks = _chunk_text(reason, chunk_size=800, overlap=200)
+    else:
+        return []
 
     documents = []
     for idx, chunk in enumerate(chunks):
@@ -323,7 +365,16 @@ QUERY_NORMALIZE = {
     "뺑소니": "도주치상 도주차량 사고후미조치",
     "도주": "도주 뺑소니 사고후미조치",
     "음주운전": "도로교통법위반 음주측정 혈중알코올농도",
+    "음주": "음주운전 도로교통법위반 혈중알코올농도",
     "무면허": "무면허운전 도로교통법위반",
+    # 구어체 → 법률 용어
+    "박았": "충돌 치상 치사", "들이받": "충돌 추돌",
+    "치어": "치상 치사 충돌", "치였": "치상 치사 충돌",
+    "친 사고": "치상 충돌", "사람을 치": "보행자 치상",
+    "시민을": "보행자", "걸어": "보행자 보행 중",
+    "행인": "보행자", "사람을 박": "보행자 치상",
+    "깔았": "역과 치상", "깔렸": "역과 치상",
+    "넘어": "전도 전복",
     "과실비율": "과실상계 기여과실 공동과실",
     "손해배상": "위자료 대인배상 대물배상",
 }
@@ -332,7 +383,7 @@ QUERY_NORMALIZE = {
 class PrecedentRAG:
     def __init__(self):
         os.environ["TMPDIR"] = "/tmp"
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        os.environ["CUDA_VISIBLE_DEVICES"] = "2"
         from FlagEmbedding import BGEM3FlagModel, FlagReranker
         from qdrant_client import QdrantClient
         from qdrant_client.models import (
@@ -421,7 +472,7 @@ class PrecedentRAG:
         keywords = [terms for trigger, terms in QUERY_NORMALIZE.items() if trigger in query]
         if not keywords:
             return query
-        normalized = f"교통사고처리특례법위반 {' '.join(keywords)}"
+        normalized = f"{query} 교통사고처리특례법위반 {' '.join(keywords)}"
         print(f"쿼리 정규화: {query}")
         print(f"  → 임베딩용: {normalized}")
         return normalized
